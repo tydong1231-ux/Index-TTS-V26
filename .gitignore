@@ -1,0 +1,46 @@
+# Downloaded model weights and Hugging Face caches
+/data/checkpoints/
+/data/hf_cache/
+/app/models--*/
+/app/examples/*.wav
+/app/prompts/**/*.wav
+/app/tests/*.wav
+
+# Bundled runtime and binary dependencies (recreated during setup)
+/runtime/
+/wheelhouse/
+
+# Generated audio, logs, reports, and local projects
+/outputs/
+/data/outputs/
+/data/*.log
+/data/*.wav
+/data/*.mp3
+/data/*.flac
+/data/*.ogg
+/projects/
+/data/.numba_cache/
+
+# Python/tooling artifacts
+__pycache__/
+*.nbc
+*.nbi
+.ipynb_checkpoints/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Large binary assets and archives should be released separately, never committed
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.dll
+*.lib
+*.exe
+*.whl
+*.zip
+*.7z

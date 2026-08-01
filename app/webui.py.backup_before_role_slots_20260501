@@ -1,0 +1,1708 @@
+﻿import html
+import json
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+import wave
+
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*GPT2InferenceModel has generative capabilities.*",
+    category=UserWarning,
+)
+
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
+import pandas as pd
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
+sys.path.append(os.path.join(current_dir, "indextts"))
+
+import argparse
+parser = argparse.ArgumentParser(
+    description="IndexTTS WebUI",
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+)
+parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
+parser.add_argument("--port", type=int, default=7860, help="Port to run the web UI on")
+parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the web UI on")
+parser.add_argument("--model_dir", type=str, default="./checkpoints", help="Model checkpoints directory")
+parser.add_argument("--fp16", action="store_true", default=False, help="Use FP16 for inference if available")
+parser.add_argument("--deepspeed", action="store_true", default=False, help="Use DeepSpeed to accelerate if available")
+parser.add_argument("--cuda_kernel", action="store_true", default=False, help="Use CUDA kernel for inference if available")
+parser.add_argument("--gui_seg_tokens", type=int, default=120, help="GUI: Max tokens per generation segment")
+cmd_args = parser.parse_args()
+
+if not os.path.exists(cmd_args.model_dir):
+    print(f"Model directory {cmd_args.model_dir} does not exist. Please download the model first.")
+    sys.exit(1)
+
+for file in [
+    "bpe.model",
+    "gpt.pth",
+    "config.yaml",
+    "s2mel.pth",
+    "wav2vec2bert_stats.pt"
+]:
+    file_path = os.path.join(cmd_args.model_dir, file)
+    if not os.path.exists(file_path):
+        print(f"Required file {file_path} does not exist. Please download it.")
+        sys.exit(1)
+
+import gradio as gr
+import indextts.gpt.transformers_modeling_utils as transformers_modeling_utils
+from indextts.infer_v2 import IndexTTS2
+from tools.i18n.i18n import I18nAuto
+
+# Silence the upstream GenerationMixin advisory during app startup.
+transformers_modeling_utils.logger.warning_once = lambda *args, **kwargs: None
+
+i18n = I18nAuto(language="Auto")
+MODE = 'local'
+tts = IndexTTS2(model_dir=cmd_args.model_dir,
+                cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
+                use_fp16=cmd_args.fp16,
+                use_deepspeed=cmd_args.deepspeed,
+                use_cuda_kernel=cmd_args.cuda_kernel,
+                )
+# 支持的语言列表
+LANGUAGES = {
+    "中文": "zh_CN",
+    "English": "en_US"
+}
+EMO_CHOICES_ALL = [i18n("与音色参考音频相同"),
+                i18n("使用情感参考音频"),
+                i18n("使用情感向量控制"),
+                i18n("使用情感描述文本控制")]
+EMO_CHOICES_OFFICIAL = EMO_CHOICES_ALL[:-1]  # skip experimental features
+
+os.makedirs("outputs/tasks",exist_ok=True)
+os.makedirs("prompts",exist_ok=True)
+
+MAX_LENGTH_TO_USE_SPEED = 70
+example_cases = []
+with open("examples/cases.jsonl", "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        example = json.loads(line)
+        if example.get("emo_audio",None):
+            emo_audio_path = os.path.join("examples",example["emo_audio"])
+        else:
+            emo_audio_path = None
+
+        example_cases.append([os.path.join("examples", example.get("prompt_audio", "sample_prompt.wav")),
+                              EMO_CHOICES_ALL[example.get("emo_mode",0)],
+                              example.get("text"),
+                             emo_audio_path,
+                             example.get("emo_weight",1.0),
+                             example.get("emo_text",""),
+                             example.get("emo_vec_1",0),
+                             example.get("emo_vec_2",0),
+                             example.get("emo_vec_3",0),
+                             example.get("emo_vec_4",0),
+                             example.get("emo_vec_5",0),
+                             example.get("emo_vec_6",0),
+                             example.get("emo_vec_7",0),
+                             example.get("emo_vec_8",0),
+                             ])
+
+def get_example_cases(include_experimental = False):
+    if include_experimental:
+        return example_cases  # show every example
+
+    # exclude emotion control mode 3 (emotion from text description)
+    return [x for x in example_cases if x[1] != EMO_CHOICES_ALL[3]]
+
+def format_glossary_markdown():
+    """将词汇表转换为Markdown表格格式"""
+    if not tts.normalizer.term_glossary:
+        return i18n("暂无术语")
+
+    lines = [f"| {i18n('术语')} | {i18n('中文读法')} | {i18n('英文读法')} |"]
+    lines.append("|---|---|---|")
+
+    for term, reading in tts.normalizer.term_glossary.items():
+        zh = reading.get("zh", "") if isinstance(reading, dict) else reading
+        en = reading.get("en", "") if isinstance(reading, dict) else reading
+        lines.append(f"| {term} | {zh} | {en} |")
+
+    return "\n".join(lines)
+
+def gen_single(emo_control_method,prompt, text,
+               emo_ref_path, emo_weight,
+               vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+               emo_text,emo_random,
+               max_text_tokens_per_segment=120,
+                *args, progress=gr.Progress()):
+    output_path = None
+    if not output_path:
+        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
+    # set gradio progress
+    tts.gr_progress = progress
+    do_sample, top_p, top_k, temperature, \
+        length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
+    kwargs = {
+        "do_sample": bool(do_sample),
+        "top_p": float(top_p),
+        "top_k": int(top_k) if int(top_k) > 0 else None,
+        "temperature": float(temperature),
+        "length_penalty": float(length_penalty),
+        "num_beams": num_beams,
+        "repetition_penalty": float(repetition_penalty),
+        "max_mel_tokens": int(max_mel_tokens),
+        # "typical_sampling": bool(typical_sampling),
+        # "typical_mass": float(typical_mass),
+    }
+    if type(emo_control_method) is not int:
+        emo_control_method = emo_control_method.value
+    if emo_control_method == 0:  # emotion from speaker
+        emo_ref_path = None  # remove external reference audio
+    if emo_control_method == 1:  # emotion from reference audio
+        pass
+    if emo_control_method == 2:  # emotion from custom vectors
+        vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
+        vec = tts.normalize_emo_vec(vec, apply_bias=True)
+    else:
+        # don't use the emotion vector inputs for the other modes
+        vec = None
+
+    if emo_text == "":
+        # erase empty emotion descriptions; `infer()` will then automatically use the main prompt
+        emo_text = None
+
+    print(f"Emo control mode:{emo_control_method},weight:{emo_weight},vec:{vec}")
+    output = tts.infer(spk_audio_prompt=prompt, text=text,
+                       output_path=output_path,
+                       emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
+                       emo_vector=vec,
+                       use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
+                       verbose=cmd_args.verbose,
+                       max_text_tokens_per_segment=int(max_text_tokens_per_segment),
+                       **kwargs)
+    return gr.update(value=output,visible=True)
+
+def update_prompt_audio():
+    update_button = gr.update(interactive=True)
+    return update_button
+
+def create_warning_message(warning_text):
+    return gr.HTML(
+        f"<div class='premium-warning'>"
+        f"<span class='premium-warning__dot'></span>"
+        f"<span class='premium-warning__text'>{html.escape(warning_text)}</span>"
+        f"</div>"
+    )
+
+def create_experimental_warning_message():
+    return create_warning_message(i18n('提示：此功能为实验版，结果尚不稳定，我们正在持续优化中。'))
+
+
+# ------------------------------------------------------------------
+# Voice Library (shared between speaker-ref and emotion-ref slots)
+# storage: ./prompts/library/<name>.<ext>
+# ------------------------------------------------------------------
+VOICE_LIB_DIR = os.path.join("prompts", "library")
+VOICE_LIB_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+os.makedirs(VOICE_LIB_DIR, exist_ok=True)
+
+
+def _safe_voice_name(name: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '', name)
+    return name[:60]
+
+
+def voice_lib_list():
+    if not os.path.isdir(VOICE_LIB_DIR):
+        return []
+    items = []
+    for fn in sorted(os.listdir(VOICE_LIB_DIR)):
+        if fn.lower().endswith(VOICE_LIB_EXTS):
+            items.append(os.path.splitext(fn)[0])
+    return items
+
+
+def voice_lib_path(name: str):
+    safe = _safe_voice_name(name)
+    if not safe:
+        return None
+    for ext in VOICE_LIB_EXTS:
+        p = os.path.join(VOICE_LIB_DIR, safe + ext)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _voice_lib_save(audio_path, name):
+    """Returns (saved_name_or_None, choices_list). Emits toast."""
+    if not audio_path:
+        gr.Warning(i18n("请先上传或录制一段音频"))
+        return None, voice_lib_list()
+    safe = _safe_voice_name(name)
+    if not safe:
+        gr.Warning(i18n("请填写音色名称"))
+        return None, voice_lib_list()
+    ext = os.path.splitext(audio_path)[1].lower() or ".wav"
+    if ext not in VOICE_LIB_EXTS:
+        ext = ".wav"
+    dst = os.path.join(VOICE_LIB_DIR, safe + ext)
+    try:
+        for old_ext in VOICE_LIB_EXTS:
+            old = os.path.join(VOICE_LIB_DIR, safe + old_ext)
+            if old_ext != ext and os.path.exists(old):
+                os.remove(old)
+        shutil.copy2(audio_path, dst)
+        gr.Info(i18n("音色已保存：") + safe, duration=2)
+    except Exception as e:
+        gr.Error(i18n("保存失败：") + str(e))
+        return None, voice_lib_list()
+    return safe, voice_lib_list()
+
+
+def on_save_to_library(audio_path, name):
+    saved, choices = _voice_lib_save(audio_path, name)
+    value = saved if saved else gr.update()
+    return gr.update(choices=choices, value=value), gr.update(choices=choices)
+
+
+def on_load_from_library(name):
+    if not name:
+        gr.Warning(i18n("请先从音色库选择一个音色"))
+        return gr.update()
+    p = voice_lib_path(name)
+    if not p:
+        gr.Warning(i18n("音色文件不存在，请刷新列表"))
+        return gr.update()
+    return gr.update(value=p)
+
+
+def on_delete_from_library(name):
+    if not name:
+        gr.Warning(i18n("请先选择要删除的音色"))
+        choices = voice_lib_list()
+        return gr.update(choices=choices), gr.update(choices=choices)
+    p = voice_lib_path(name)
+    if p and os.path.exists(p):
+        try:
+            os.remove(p)
+            gr.Info(i18n("已删除：") + name, duration=2)
+        except Exception as e:
+            gr.Error(i18n("删除失败：") + str(e))
+    choices = voice_lib_list()
+    return gr.update(choices=choices, value=None), gr.update(choices=choices, value=None)
+
+
+def on_refresh_library():
+    choices = voice_lib_list()
+    return gr.update(choices=choices), gr.update(choices=choices)
+
+
+# Multi-role dialogue generation.
+DIALOGUE_ROLE_PATTERN = re.compile(r"^\s*([^:\uff1a]{1,32})\s*[:\uff1a]\s*(.+?)\s*$")
+DIALOGUE_OUTPUT_DIR = os.path.join("outputs", "dialogue")
+
+
+def parse_dialogue_script(script: str):
+    lines = []
+    for raw_line in (script or "").splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        match = DIALOGUE_ROLE_PATTERN.match(raw_line)
+        if not match:
+            continue
+        role = match.group(1).strip()
+        text = match.group(2).strip()
+        if role and text:
+            lines.append({"role": role, "text": text})
+    return lines
+
+
+def dialogue_preview_data(script: str):
+    lines = parse_dialogue_script(script)
+    return [[idx + 1, item["role"], item["text"]] for idx, item in enumerate(lines)]
+
+
+def dialogue_roles(lines):
+    roles = []
+    seen = set()
+    for item in lines:
+        role = item["role"]
+        if role not in seen:
+            roles.append(role)
+            seen.add(role)
+    return roles
+
+
+def dialogue_voice_library_data():
+    voices = voice_lib_list()
+    rows = []
+    for idx, name in enumerate(voices):
+        path = voice_lib_path(name) or ""
+        rows.append([idx + 1, name, path])
+    return rows
+
+
+def parse_role_voice_map(mapping_text: str):
+    mapping = {}
+    for raw_line in (mapping_text or "").splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line or raw_line.startswith("#"):
+            continue
+        if "=" in raw_line:
+            role, voice = raw_line.split("=", 1)
+        elif ":" in raw_line:
+            role, voice = raw_line.split(":", 1)
+        elif "\uff1a" in raw_line:
+            role, voice = raw_line.split("\uff1a", 1)
+        else:
+            continue
+        role = role.strip()
+        voice = voice.strip().strip('"').strip("'")
+        if role and voice:
+            mapping[role] = voice
+    return mapping
+
+
+def resolve_role_voice(voice_ref: str):
+    if not voice_ref:
+        return None
+    if os.path.exists(voice_ref):
+        return voice_ref
+    lib_path = voice_lib_path(voice_ref)
+    if lib_path:
+        return lib_path
+    return None
+
+
+def build_role_mapping_template(script: str, current_mapping: str = ""):
+    lines = parse_dialogue_script(script)
+    if not lines:
+        return gr.update(value=current_mapping or ""), gr.update(value=[])
+
+    existing = parse_role_voice_map(current_mapping)
+    role_names = dialogue_roles(lines)
+    template_lines = []
+    available_voices = voice_lib_list()
+    for role in role_names:
+        voice = existing.get(role, "")
+        if not voice and role in available_voices:
+            voice = role
+        template_lines.append(f"{role}={voice}")
+    return gr.update(value="\n".join(template_lines)), gr.update(value=dialogue_preview_data(script))
+
+
+def refresh_dialogue_voice_library():
+    voices = voice_lib_list()
+    return gr.update(value=dialogue_voice_library_data()), gr.update(choices=voices, value=voices[0] if voices else None)
+
+
+def fill_dialogue_voice_mapping(mapping_text: str, selected_voice: str):
+    if not selected_voice:
+        gr.Warning(i18n("请先选择一个音色"))
+        return gr.update()
+
+    lines = (mapping_text or "").splitlines()
+    if not lines:
+        return gr.update(value=f"角色={selected_voice}")
+
+    updated = []
+    filled = False
+    for line in lines:
+        raw = line
+        stripped = line.strip()
+        if not filled and stripped and not stripped.startswith("#"):
+            separator = None
+            for item in ("=", ":", "\uff1a"):
+                if item in raw:
+                    separator = item
+                    break
+            if separator:
+                role, voice = raw.split(separator, 1)
+                if role.strip() and not voice.strip():
+                    raw = f"{role.strip()}={selected_voice}"
+                    filled = True
+        updated.append(raw)
+
+    if not filled:
+        updated.append(f"角色={selected_voice}")
+    return gr.update(value="\n".join(updated))
+
+
+def combine_wav_files(wav_paths, output_path, interval_ms=450):
+    if not wav_paths:
+        raise ValueError("No dialogue audio segments were generated.")
+
+    with wave.open(wav_paths[0], "rb") as first:
+        params = first.getparams()
+        nchannels = first.getnchannels()
+        sampwidth = first.getsampwidth()
+        framerate = first.getframerate()
+
+    silence_frames = int(framerate * max(0, int(interval_ms)) / 1000)
+    silence = b"\x00" * silence_frames * nchannels * sampwidth
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    with wave.open(output_path, "wb") as output:
+        output.setparams(params)
+        for idx, path in enumerate(wav_paths):
+            with wave.open(path, "rb") as segment:
+                if segment.getnchannels() != nchannels or segment.getsampwidth() != sampwidth or segment.getframerate() != framerate:
+                    raise ValueError(f"Audio format mismatch while combining: {path}")
+                output.writeframes(segment.readframes(segment.getnframes()))
+            if idx < len(wav_paths) - 1 and silence:
+                output.writeframes(silence)
+
+
+def gen_dialogue(script, role_mapping_text, interval_ms, max_text_tokens_per_segment=120, *args, progress=gr.Progress()):
+    lines = parse_dialogue_script(script)
+    if not lines:
+        gr.Warning(i18n("没有解析到角色台词，请使用“角色：台词”格式"))
+        return gr.update(value=None), gr.update(value=[]), gr.update(value="")
+
+    role_mapping = parse_role_voice_map(role_mapping_text)
+    missing_roles = []
+    resolved_voices = {}
+    for role in dialogue_roles(lines):
+        voice_path = resolve_role_voice(role_mapping.get(role, ""))
+        if not voice_path:
+            missing_roles.append(role)
+        else:
+            resolved_voices[role] = voice_path
+
+    if missing_roles:
+        gr.Warning(i18n("这些角色还没有绑定可用音色：") + "、".join(missing_roles))
+        return gr.update(value=None), gr.update(value=dialogue_preview_data(script)), gr.update(value="")
+
+    do_sample, top_p, top_k, temperature, \
+        length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
+    kwargs = {
+        "do_sample": bool(do_sample),
+        "top_p": float(top_p),
+        "top_k": int(top_k) if int(top_k) > 0 else None,
+        "temperature": float(temperature),
+        "length_penalty": float(length_penalty),
+        "num_beams": num_beams,
+        "repetition_penalty": float(repetition_penalty),
+        "max_mel_tokens": int(max_mel_tokens),
+    }
+
+    task_id = time.strftime("dialogue_%Y%m%d_%H%M%S")
+    task_dir = os.path.join(DIALOGUE_OUTPUT_DIR, task_id)
+    os.makedirs(task_dir, exist_ok=True)
+
+    generated_paths = []
+    manifest_rows = []
+    total = len(lines)
+    for idx, item in enumerate(lines):
+        role = item["role"]
+        text = item["text"]
+        safe_role = _safe_voice_name(role) or f"role_{idx + 1}"
+        output_path = os.path.join(task_dir, f"{idx + 1:03d}_{safe_role}.wav")
+        progress((idx + 1) / total, desc=f"{role} {idx + 1}/{total}")
+        result = tts.infer(
+            spk_audio_prompt=resolved_voices[role],
+            text=text,
+            output_path=output_path,
+            emo_audio_prompt=None,
+            emo_alpha=0.65,
+            emo_vector=None,
+            use_emo_text=False,
+            emo_text=None,
+            use_random=False,
+            verbose=cmd_args.verbose,
+            max_text_tokens_per_segment=int(max_text_tokens_per_segment),
+            **kwargs,
+        )
+        if hasattr(result, "__iter__") and not isinstance(result, (str, bytes, tuple, list)):
+            result = list(result)[-1]
+        generated_paths.append(output_path)
+        manifest_rows.append([idx + 1, role, text, output_path])
+
+    final_path = os.path.join(task_dir, "dialogue_full.wav")
+    combine_wav_files(generated_paths, final_path, interval_ms=interval_ms)
+    manifest_path = os.path.join(task_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest_rows, f, ensure_ascii=False, indent=2)
+
+    status = i18n("生成完成：") + final_path
+    return gr.update(value=final_path, visible=True), gr.update(value=manifest_rows), gr.update(value=status)
+
+
+PREMIUM_THEME = gr.themes.Base(
+    primary_hue=gr.themes.colors.blue,
+    secondary_hue=gr.themes.colors.emerald,
+    neutral_hue=gr.themes.colors.slate,
+    font=["Inter", "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", "PingFang SC", "ui-sans-serif", "system-ui", "sans-serif"],
+    font_mono=["Cascadia Mono", "SFMono-Regular", "Consolas", "ui-monospace", "monospace"],
+)
+
+PREMIUM_CSS = """
+:root {
+    --wb-bg: #0d1117;
+    --wb-bg-soft: #111722;
+    --wb-panel: #151b24;
+    --wb-panel-raised: #19212d;
+    --wb-panel-solid: #101620;
+    --wb-input: #0b1018;
+    --wb-border: rgba(226, 232, 240, 0.12);
+    --wb-border-strong: rgba(226, 232, 240, 0.22);
+    --wb-text: #f8fafc;
+    --wb-muted: #a7b0bf;
+    --wb-faint: #707b8d;
+    --wb-blue: #3b82f6;
+    --wb-blue-hover: #60a5fa;
+    --wb-green: #22c55e;
+    --wb-green-soft: rgba(34, 197, 94, 0.12);
+    --wb-red: #ef4444;
+    --wb-red-soft: rgba(239, 68, 68, 0.12);
+    --wb-amber: #f59e0b;
+    --wb-radius: 8px;
+    --wb-radius-sm: 6px;
+    --wb-shadow: 0 18px 52px rgba(0, 0, 0, 0.30), inset 0 1px 0 rgba(255,255,255,0.04);
+    --wb-font: "Inter", "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    --wb-mono: "Cascadia Mono", "SFMono-Regular", Consolas, ui-monospace, monospace;
+}
+
+html, body, .gradio-container {
+    background: var(--wb-bg) !important;
+    color: var(--wb-text) !important;
+    font-family: var(--wb-font) !important;
+    letter-spacing: 0 !important;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+.gradio-container {
+    max-width: 1640px !important;
+    min-height: 100vh;
+    margin: 0 auto !important;
+    padding: 18px 24px 34px !important;
+    background:
+        linear-gradient(180deg, rgba(255,255,255,0.035) 0, rgba(255,255,255,0) 170px),
+        var(--wb-bg) !important;
+}
+
+.gradio-container::before { display: none !important; }
+.gradio-container > * { position: relative; z-index: 1; }
+
+.console-hero {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    min-height: 66px;
+    margin: 0 0 14px;
+    padding: 12px 16px;
+    border: 1px solid var(--wb-border);
+    border-radius: var(--wb-radius);
+    background: linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.018)), var(--wb-panel);
+    box-shadow: var(--wb-shadow);
+}
+
+.console-brand {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    min-width: 0;
+}
+
+.console-mark {
+    width: 40px;
+    height: 40px;
+    display: grid;
+    place-items: center;
+    flex: 0 0 auto;
+    border-radius: var(--wb-radius-sm);
+    border: 1px solid rgba(59,130,246,0.45);
+    background: linear-gradient(180deg, rgba(59,130,246,0.22), rgba(59,130,246,0.08)), #101826;
+    color: #bfdbfe;
+    font-family: var(--wb-mono);
+    font-size: 13px;
+    font-weight: 800;
+}
+
+.console-title {
+    color: var(--wb-text);
+    font-size: 20px;
+    line-height: 1.15;
+    font-weight: 760;
+    letter-spacing: 0 !important;
+}
+
+.console-subtitle {
+    margin-top: 3px;
+    color: var(--wb-faint);
+    font-family: var(--wb-mono);
+    font-size: 11px;
+    letter-spacing: 0 !important;
+    text-transform: uppercase;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.console-status {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.console-status span {
+    display: inline-flex;
+    align-items: center;
+    min-height: 28px;
+    padding: 5px 10px;
+    border: 1px solid var(--wb-border);
+    border-radius: 999px;
+    background: rgba(11, 16, 24, 0.76);
+    color: var(--wb-muted);
+    font-family: var(--wb-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0 !important;
+}
+
+.console-status a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 28px;
+    padding: 5px 11px;
+    border: 1px solid rgba(96,165,250,0.46);
+    border-radius: 999px;
+    background: rgba(59,130,246,0.13);
+    color: #bfdbfe !important;
+    font-family: var(--wb-font);
+    font-size: 12px;
+    font-weight: 760;
+    letter-spacing: 0 !important;
+    text-decoration: none !important;
+}
+
+.console-status a::after {
+    content: ">";
+    margin-left: 7px;
+    color: #93c5fd;
+    font-family: var(--wb-mono);
+}
+
+.console-status a:hover {
+    border-color: rgba(147,197,253,0.72);
+    background: rgba(59,130,246,0.20);
+    color: #ffffff !important;
+}
+
+.console-status span:first-child::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    margin-right: 7px;
+    border-radius: 999px;
+    background: var(--wb-green);
+    box-shadow: 0 0 0 4px rgba(34,197,94,0.12);
+}
+
+.premium-hero, .premium-footer { display: none !important; }
+
+.gradio-container .tab-nav,
+.gradio-container .tabs > .tab-nav {
+    margin: 0 0 12px !important;
+    padding: 0 !important;
+    gap: 0 !important;
+    border: 0 !important;
+    border-bottom: 1px solid var(--wb-border) !important;
+    background: transparent !important;
+}
+
+.gradio-container .tab-nav button {
+    padding: 10px 14px !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    border-bottom: 2px solid transparent !important;
+    background: transparent !important;
+    color: var(--wb-muted) !important;
+    font-size: 13px !important;
+    font-weight: 700 !important;
+    letter-spacing: 0 !important;
+}
+
+.gradio-container .tab-nav button.selected {
+    color: var(--wb-text) !important;
+    border-bottom-color: var(--wb-blue) !important;
+    box-shadow: none !important;
+}
+
+.studio-command-grid,
+.gradio-container .studio-command-grid {
+    display: grid !important;
+    grid-template-columns: minmax(240px, 0.62fr) minmax(500px, 1.48fr) minmax(320px, 0.9fr) !important;
+    gap: 14px !important;
+    align-items: start !important;
+}
+
+.studio-command-grid > .gr-column,
+.studio-command-grid > .block,
+.studio-command-grid > div { min-width: 0 !important; }
+
+.studio-card,
+.studio-command-grid > .block,
+.studio-command-grid > div {
+    padding: 14px !important;
+    border: 1px solid var(--wb-border) !important;
+    border-radius: var(--wb-radius) !important;
+    background: linear-gradient(180deg, rgba(255,255,255,0.038), rgba(255,255,255,0.012)), var(--wb-panel) !important;
+    box-shadow: var(--wb-shadow) !important;
+}
+
+.studio-card--voice {
+    padding: 12px !important;
+    border-top: 2px solid rgba(148,163,184,0.50) !important;
+}
+.studio-card--compose { border-top: 2px solid rgba(59,130,246,0.62) !important; }
+.studio-card--output,
+.studio-command-grid > .block:last-child,
+.studio-command-grid > div:last-child { border-top: 2px solid rgba(34,197,94,0.58) !important; }
+
+.studio-section-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 0 0 12px !important;
+    padding: 0 0 9px !important;
+    border-bottom: 1px solid var(--wb-border) !important;
+}
+
+.studio-section-title__main {
+    color: var(--wb-text) !important;
+    font-size: 13px !important;
+    font-weight: 780 !important;
+    line-height: 1.2;
+    letter-spacing: 0 !important;
+}
+
+.studio-section-title__meta {
+    color: var(--wb-faint) !important;
+    font-family: var(--wb-mono);
+    font-size: 10.5px !important;
+    font-weight: 700;
+    letter-spacing: 0 !important;
+}
+
+.gradio-container .gr-group,
+.gradio-container .gr-box,
+.gradio-container .gr-panel,
+.gradio-container .gr-form,
+.gradio-container .block,
+.gradio-container .form,
+.gradio-container details {
+    border-color: var(--wb-border) !important;
+    border-radius: var(--wb-radius) !important;
+    background: var(--wb-panel-raised) !important;
+    box-shadow: none !important;
+}
+
+.studio-card .block,
+.studio-card .form,
+.studio-card .gr-form,
+.studio-card .gr-box,
+.studio-card .gr-panel {
+    background: transparent !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+}
+
+.gradio-container label,
+.gradio-container .label-wrap span,
+.gradio-container .gr-form > label {
+    color: var(--wb-muted) !important;
+    font-size: 12px !important;
+    font-weight: 680 !important;
+    letter-spacing: 0 !important;
+}
+
+.gradio-container textarea,
+.gradio-container input[type="text"],
+.gradio-container input[type="number"],
+.gradio-container .gr-textbox textarea,
+.gradio-container .gr-textbox input,
+.gradio-container select {
+    border: 1px solid var(--wb-border) !important;
+    border-radius: var(--wb-radius-sm) !important;
+    background: var(--wb-input) !important;
+    color: var(--wb-text) !important;
+    font-family: var(--wb-font) !important;
+    font-size: 14px !important;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.035) !important;
+}
+
+.gradio-container textarea {
+    min-height: 228px !important;
+    line-height: 1.58 !important;
+    resize: vertical;
+}
+
+.gradio-container textarea:focus,
+.gradio-container input:focus {
+    border-color: rgba(59,130,246,0.70) !important;
+    box-shadow: 0 0 0 3px rgba(59,130,246,0.16), inset 0 1px 0 rgba(255,255,255,0.035) !important;
+    outline: none !important;
+}
+
+.gradio-container ::placeholder { color: var(--wb-faint) !important; opacity: 1; }
+
+.gradio-container button:not(.selected),
+.gradio-container .gr-button:not(.selected),
+.voice-lib-row button {
+    min-height: 34px !important;
+    border: 1px solid var(--wb-border-strong) !important;
+    border-radius: var(--wb-radius-sm) !important;
+    background: #232b38 !important;
+    color: var(--wb-text) !important;
+    font-size: 13px !important;
+    font-weight: 720 !important;
+    letter-spacing: 0 !important;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.045) !important;
+    transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.gradio-container button:not(.selected):hover,
+.gradio-container .gr-button:not(.selected):hover,
+.voice-lib-row button:hover {
+    background: #2c3747 !important;
+    border-color: rgba(226,232,240,0.32) !important;
+    color: #ffffff !important;
+}
+
+#gen_button_wrap button,
+button#component-gen_button,
+button[id*="gen_button"],
+.gradio-container button.primary,
+.gradio-container button[variant="primary"] {
+    width: 100% !important;
+    min-height: 48px !important;
+    border: 1px solid rgba(147,197,253,0.55) !important;
+    border-radius: var(--wb-radius-sm) !important;
+    background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%) !important;
+    color: #ffffff !important;
+    font-size: 15px !important;
+    font-weight: 820 !important;
+    text-shadow: none !important;
+    box-shadow: 0 14px 28px rgba(37,99,235,0.20), inset 0 1px 0 rgba(255,255,255,0.22) !important;
+}
+
+#gen_button_wrap button:hover,
+button#component-gen_button:hover,
+button[id*="gen_button"]:hover {
+    background: linear-gradient(180deg, #60a5fa 0%, #2f6fec 100%) !important;
+    color: #ffffff !important;
+}
+
+.voice-lib-row {
+    gap: 6px !important;
+    margin-top: 6px !important;
+    align-items: center !important;
+    justify-content: flex-start !important;
+}
+
+.voice-lib-row button {
+    min-width: 54px !important;
+    min-height: 30px !important;
+    padding: 5px 9px !important;
+    font-size: 11.5px !important;
+}
+
+.voice-name-input {
+    flex: 0 0 148px !important;
+    width: 148px !important;
+    max-width: 148px !important;
+    min-width: 112px !important;
+}
+
+.voice-name-input input,
+.voice-name-input textarea {
+    min-height: 30px !important;
+    height: 30px !important;
+    padding: 5px 9px !important;
+    font-size: 12px !important;
+    line-height: 18px !important;
+}
+
+.voice-btn-save button,
+button.voice-btn-save {
+    border-color: rgba(34,197,94,0.42) !important;
+    background: var(--wb-green-soft) !important;
+    color: #bbf7d0 !important;
+}
+
+.voice-btn-danger button,
+button.voice-btn-danger {
+    border-color: rgba(239,68,68,0.42) !important;
+    background: var(--wb-red-soft) !important;
+    color: #fecaca !important;
+}
+
+.gradio-container .gr-audio {
+    min-height: 168px !important;
+    overflow: hidden !important;
+    border: 1px solid var(--wb-border) !important;
+    border-radius: var(--wb-radius) !important;
+    background: var(--wb-input) !important;
+}
+
+.studio-card--voice .gr-audio {
+    min-height: 108px !important;
+}
+
+.studio-card--voice .studio-section-title {
+    margin-bottom: 8px !important;
+    padding-bottom: 7px !important;
+}
+
+.studio-card--voice input[type="text"],
+.studio-card--voice .gr-textbox input,
+.studio-card--voice select {
+    min-height: 30px !important;
+    padding: 6px 9px !important;
+    font-size: 12.5px !important;
+}
+
+.studio-card--output .gr-audio,
+.studio-command-grid > .block:last-child .gr-audio,
+.studio-command-grid > div:last-child .gr-audio {
+    min-height: 228px !important;
+}
+
+.gradio-container input[type="range"] { accent-color: var(--wb-blue) !important; }
+.gradio-container input[type="checkbox"],
+.gradio-container input[type="radio"] { accent-color: var(--wb-blue) !important; }
+
+.gradio-container .gr-radio label,
+.gradio-container .gr-checkbox label {
+    padding: 8px 12px !important;
+    border: 1px solid var(--wb-border) !important;
+    border-radius: var(--wb-radius-sm) !important;
+    background: #202838 !important;
+    color: var(--wb-muted) !important;
+    font-weight: 700 !important;
+}
+
+.studio-controls-row {
+    margin-top: 12px !important;
+    padding: 10px 12px !important;
+    border: 1px solid var(--wb-border) !important;
+    border-radius: var(--wb-radius) !important;
+    background: var(--wb-panel) !important;
+    gap: 14px !important;
+    align-items: center !important;
+}
+
+.gradio-container details {
+    margin-top: 12px !important;
+    overflow: hidden !important;
+}
+
+.gradio-container details > summary,
+.gradio-container .gr-accordion > summary,
+.gradio-container .label-wrap {
+    padding: 11px 13px !important;
+    border-bottom-color: var(--wb-border) !important;
+    background: #151b24 !important;
+    color: var(--wb-text) !important;
+    font-weight: 760 !important;
+}
+
+.gradio-container table {
+    border-collapse: separate !important;
+    border-spacing: 0 !important;
+    background: transparent !important;
+}
+
+.gradio-container table th {
+    background: #151b24 !important;
+    color: var(--wb-muted) !important;
+    font-size: 12px !important;
+    font-weight: 760 !important;
+    border-bottom: 1px solid var(--wb-border) !important;
+}
+
+.gradio-container table td {
+    color: var(--wb-text) !important;
+    border-bottom: 1px solid var(--wb-border) !important;
+}
+
+.gradio-container .prose,
+.gradio-container .md,
+.gradio-container .info-text,
+.gradio-container [data-testid="info"],
+.gradio-container .gr-info {
+    color: var(--wb-muted) !important;
+    font-size: 12.5px !important;
+}
+
+.gradio-container .prose strong,
+.gradio-container .md strong { color: var(--wb-text) !important; }
+.gradio-container .prose a,
+.gradio-container .md a { color: #93c5fd !important; text-decoration: none !important; }
+
+.premium-warning {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    padding: 9px 12px;
+    border: 1px solid rgba(245,158,11,0.36);
+    border-radius: var(--wb-radius-sm);
+    background: rgba(245,158,11,0.10);
+    color: #fcd34d;
+    font-size: 12.5px;
+    font-weight: 700;
+}
+
+.premium-warning__dot {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 auto;
+    border-radius: 999px;
+    background: var(--wb-amber);
+}
+
+.examples-accordion table,
+.examples-accordion .table-wrap { font-size: 12px !important; }
+
+.console-footer {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 20px;
+    padding-top: 12px;
+    border-top: 1px solid var(--wb-border);
+    color: var(--wb-faint);
+    font-family: var(--wb-mono);
+    font-size: 11px;
+    letter-spacing: 0 !important;
+}
+
+.gradio-container ::-webkit-scrollbar { width: 10px; height: 10px; }
+.gradio-container ::-webkit-scrollbar-track { background: transparent; }
+.gradio-container ::-webkit-scrollbar-thumb {
+    background: rgba(148,163,184,0.22);
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background-clip: padding-box;
+}
+.gradio-container ::-webkit-scrollbar-thumb:hover { background: rgba(148,163,184,0.34); background-clip: padding-box; }
+
+@media (max-width: 1180px) {
+    .studio-command-grid,
+    .gradio-container .studio-command-grid { grid-template-columns: 1fr !important; }
+    .console-hero { align-items: flex-start; flex-direction: column; }
+    .console-status { justify-content: flex-start; }
+    .console-subtitle { white-space: normal; }
+}
+
+@media (max-width: 720px) {
+    .gradio-container { padding: 12px 12px 24px !important; }
+    .console-hero { min-height: 0; padding: 11px 12px; }
+    .console-title { font-size: 18px; }
+    .console-status span { font-size: 10px; }
+    .studio-card,
+    .studio-command-grid > .block,
+    .studio-command-grid > div { padding: 12px !important; }
+    .console-footer { flex-direction: column; }
+}
+"""
+
+PREMIUM_HERO_HTML = """
+<div class="console-hero">
+  <div class="console-brand">
+    <div class="console-mark">IT</div>
+    <div>
+      <div class="console-title">IndexTTS-V26</div>
+      <div class="console-subtitle">By 王知风</div>
+    </div>
+  </div>
+  <div class="console-status">
+    <span>LOCAL READY</span>
+    <span>INDEXTTS 2</span>
+    <span>CUDA 12.8</span>
+    <a href="https://wangzhifeng.vip/" target="_blank" rel="noopener noreferrer">更多AI工具</a>
+  </div>
+</div>
+"""
+
+PREMIUM_FOOTER_HTML = """
+<div class="console-footer">
+  <span>IndexTTS-V26 / By 王知风</span>
+  <span>Local inference package / V26</span>
+</div>
+"""
+with gr.Blocks(title="IndexTTS-V26", theme=PREMIUM_THEME, css=PREMIUM_CSS) as demo:
+    mutex = threading.Lock()
+    gr.HTML(PREMIUM_HERO_HTML)
+
+    with gr.Tab(i18n("音频生成")):
+        with gr.Row(elem_classes=["studio-command-grid"]):
+            os.makedirs("prompts",exist_ok=True)
+            with gr.Column(elem_classes=["voice-col", "studio-card", "studio-card--voice"]):
+                gr.HTML('<div class="studio-section-title"><span class="studio-section-title__main">Voice Asset</span><span class="studio-section-title__meta">REFERENCE</span></div>')
+                prompt_audio = gr.Audio(label=i18n("音色参考音频"),key="prompt_audio",
+                                        sources=["upload","microphone"],type="filepath")
+                with gr.Row(elem_classes=["voice-lib-row"]):
+                    voice_save_name = gr.Textbox(
+                        show_label=False, placeholder=i18n("给当前音色起个名字"),
+                        scale=1, container=False, elem_classes=["voice-name-input"],
+                    )
+                    voice_save_btn = gr.Button(i18n("保存音色"), scale=1, size="sm", elem_classes=["voice-btn-save"])
+                with gr.Row(elem_classes=["voice-lib-row"]):
+                    voice_dropdown = gr.Dropdown(
+                        choices=voice_lib_list(), show_label=False,
+                        value=None, scale=3, container=False,
+                        allow_custom_value=False,
+                    )
+                    voice_load_btn = gr.Button(i18n("加载"), scale=1, size="sm")
+                    voice_delete_btn = gr.Button(i18n("删除"), scale=1, size="sm", elem_classes=["voice-btn-danger"])
+            prompt_list = os.listdir("prompts")
+            default = ''
+            if prompt_list:
+                default = prompt_list[0]
+            with gr.Column(elem_classes=["studio-card", "studio-card--compose"]):
+                gr.HTML('<div class="studio-section-title"><span class="studio-section-title__main">Script Composer</span><span class="studio-section-title__meta">TEXT TO SPEECH</span></div>')
+                input_text_single = gr.TextArea(label=i18n("文本"),key="input_text_single", placeholder=i18n("请输入目标文本"), info=f"{i18n('当前模型版本')}{tts.model_version or '1.0'}")
+                gen_button = gr.Button(i18n("生成语音"), key="gen_button", interactive=True, variant="primary", size="lg", elem_id="gen_button_wrap")
+            with gr.Column(elem_classes=["studio-card", "studio-card--output"]):
+                gr.HTML('<div class="studio-section-title"><span class="studio-section-title__main">Synthesis Result</span><span class="studio-section-title__meta">OUTPUT</span></div>')
+                output_audio = gr.Audio(label=i18n("生成结果"), visible=True,key="output_audio")
+
+        with gr.Row(elem_classes=["studio-controls-row"]):
+            experimental_checkbox = gr.Checkbox(label=i18n("显示实验功能"), value=False)
+            glossary_checkbox = gr.Checkbox(label=i18n("开启术语词汇读音"), value=tts.normalizer.enable_glossary)
+        with gr.Accordion(i18n("功能设置")):
+            # 情感控制选项部分
+            with gr.Row():
+                emo_control_method = gr.Radio(
+                    choices=EMO_CHOICES_OFFICIAL,
+                    type="index",
+                    value=EMO_CHOICES_OFFICIAL[0],label=i18n("情感控制方式"))
+                # we MUST have an extra, INVISIBLE list of *all* emotion control
+                # methods so that gr.Dataset() can fetch ALL control mode labels!
+                # otherwise, the gr.Dataset()'s experimental labels would be empty!
+                emo_control_method_all = gr.Radio(
+                    choices=EMO_CHOICES_ALL,
+                    type="index",
+                    value=EMO_CHOICES_ALL[0], label=i18n("情感控制方式"),
+                    visible=False)  # do not render
+        # 情感参考音频部分
+        with gr.Group(visible=False, elem_classes=["emo-control-narrow"]) as emotion_reference_group:
+            with gr.Column(elem_classes=["voice-col"]):
+                emo_upload = gr.Audio(label=i18n("上传情感参考音频"), type="filepath")
+                with gr.Row(elem_classes=["voice-lib-row"]):
+                    emo_save_name = gr.Textbox(
+                        show_label=False, placeholder=i18n("给当前情感音色起个名字"),
+                        scale=1, container=False, elem_classes=["voice-name-input"],
+                    )
+                    emo_save_btn = gr.Button(i18n("保存音色"), scale=1, size="sm", elem_classes=["voice-btn-save"])
+                with gr.Row(elem_classes=["voice-lib-row"]):
+                    emo_dropdown = gr.Dropdown(
+                        choices=voice_lib_list(), show_label=False,
+                        value=None, scale=3, container=False,
+                        allow_custom_value=False,
+                    )
+                    emo_load_btn = gr.Button(i18n("加载"), scale=1, size="sm")
+                    emo_delete_btn = gr.Button(i18n("删除"), scale=1, size="sm", elem_classes=["voice-btn-danger"])
+
+        # 情感随机采样
+        with gr.Row(visible=False, elem_classes=["emo-control-narrow"]) as emotion_randomize_group:
+            emo_random = gr.Checkbox(label=i18n("情感随机采样"), value=False)
+
+        # 情感向量控制部分
+        with gr.Group(visible=False) as emotion_vector_group:
+            with gr.Row():
+                with gr.Column():
+                    vec1 = gr.Slider(label=i18n("喜"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
+                    vec2 = gr.Slider(label=i18n("怒"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
+                    vec3 = gr.Slider(label=i18n("哀"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
+                    vec4 = gr.Slider(label=i18n("惧"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
+                with gr.Column():
+                    vec5 = gr.Slider(label=i18n("厌恶"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
+                    vec6 = gr.Slider(label=i18n("低落"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
+                    vec7 = gr.Slider(label=i18n("惊喜"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
+                    vec8 = gr.Slider(label=i18n("平静"), minimum=0.0, maximum=1.0, value=0.0, step=0.05)
+
+        with gr.Group(visible=False, elem_classes=["emo-control-narrow"]) as emo_text_group:
+            create_experimental_warning_message()
+            with gr.Row():
+                emo_text = gr.Textbox(label=i18n("情感描述文本"),
+                                      placeholder=i18n("请输入情绪描述（或留空以自动使用目标文本作为情绪描述）"),
+                                      value="",
+                                      info=i18n("例如：委屈巴巴、危险在悄悄逼近"))
+
+        with gr.Row(visible=False, elem_classes=["emo-control-narrow"]) as emo_weight_group:
+            emo_weight = gr.Slider(label=i18n("情感权重"), minimum=0.0, maximum=1.0, value=0.65, step=0.01)
+
+        # 术语词汇表管理
+        with gr.Accordion(i18n("自定义术语词汇读音"), open=False, visible=tts.normalizer.enable_glossary) as glossary_accordion:
+            gr.Markdown(i18n("自定义个别专业术语的读音"))
+            with gr.Row():
+                with gr.Column(scale=1):
+                    glossary_term = gr.Textbox(
+                        label=i18n("术语"),
+                        placeholder="IndexTTS2",
+                    )
+                    glossary_reading_zh = gr.Textbox(
+                        label=i18n("中文读法"),
+                        placeholder="Index T-T-S 二",
+                    )
+                    glossary_reading_en = gr.Textbox(
+                        label=i18n("英文读法"),
+                        placeholder="Index T-T-S two",
+                    )
+                    btn_add_term = gr.Button(i18n("添加术语"), scale=1)
+                with gr.Column(scale=2):
+                    glossary_table = gr.Markdown(
+                        value=format_glossary_markdown()
+                    )
+
+        with gr.Accordion(i18n("高级生成参数设置"), open=False, visible=True) as advanced_settings_group:
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown(f"**{i18n('GPT2 采样设置')}** _{i18n('参数会影响音频多样性和生成速度详见')} [Generation strategies](https://huggingface.co/docs/transformers/main/en/generation_strategies)._")
+                    with gr.Row():
+                        do_sample = gr.Checkbox(label="do_sample", value=True, info=i18n("是否进行采样"))
+                        temperature = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.1)
+                    with gr.Row():
+                        top_p = gr.Slider(label="top_p", minimum=0.0, maximum=1.0, value=0.8, step=0.01)
+                        top_k = gr.Slider(label="top_k", minimum=0, maximum=100, value=30, step=1)
+                        num_beams = gr.Slider(label="num_beams", value=3, minimum=1, maximum=10, step=1)
+                    with gr.Row():
+                        repetition_penalty = gr.Number(label="repetition_penalty", precision=None, value=10.0, minimum=0.1, maximum=20.0, step=0.1)
+                        length_penalty = gr.Number(label="length_penalty", precision=None, value=0.0, minimum=-2.0, maximum=2.0, step=0.1)
+                    max_mel_tokens = gr.Slider(label="max_mel_tokens", value=1500, minimum=50, maximum=tts.cfg.gpt.max_mel_tokens, step=10, info=i18n("生成Token最大数量，过小导致音频被截断"), key="max_mel_tokens")
+                    # with gr.Row():
+                    #     typical_sampling = gr.Checkbox(label="typical_sampling", value=False, info="不建议使用")
+                    #     typical_mass = gr.Slider(label="typical_mass", value=0.9, minimum=0.0, maximum=1.0, step=0.1)
+                with gr.Column(scale=2):
+                    gr.Markdown(f'**{i18n("分句设置")}** _{i18n("参数会影响音频质量和生成速度")}_')
+                    with gr.Row():
+                        initial_value = max(20, min(tts.cfg.gpt.max_text_tokens, cmd_args.gui_seg_tokens))
+                        max_text_tokens_per_segment = gr.Slider(
+                            label=i18n("分句最大Token数"), value=initial_value, minimum=20, maximum=tts.cfg.gpt.max_text_tokens, step=2, key="max_text_tokens_per_segment",
+                            info=i18n("建议80~200之间，值越大，分句越长；值越小，分句越碎；过小过大都可能导致音频质量不高"),
+                        )
+                    with gr.Accordion(i18n("预览分句结果"), open=True) as segments_settings:
+                        segments_preview = gr.Dataframe(
+                            headers=[i18n("序号"), i18n("分句内容"), i18n("Token数")],
+                            key="segments_preview",
+                            wrap=True,
+                        )
+            advanced_params = [
+                do_sample, top_p, top_k, temperature,
+                length_penalty, num_beams, repetition_penalty, max_mel_tokens,
+                # typical_sampling, typical_mass,
+            ]
+
+        # we must use `gr.Dataset` to support dynamic UI rewrites, since `gr.Examples`
+        # binds tightly to UI and always restores the initial state of all components,
+        # such as the list of available choices in emo_control_method.
+        with gr.Accordion(i18n("示例 Examples"), open=False, elem_classes=["examples-accordion"]):
+            example_table = gr.Dataset(label="Examples",
+                samples_per_page=20,
+                samples=get_example_cases(include_experimental=False),
+                type="values",
+                # these components are NOT "connected". it just reads the column labels/available
+                # states from them, so we MUST link to the "all options" versions of all components,
+                # such as `emo_control_method_all` (to be able to see EXPERIMENTAL text labels)!
+                components=[prompt_audio,
+                            emo_control_method_all,  # important: support all mode labels!
+                            input_text_single,
+                            emo_upload,
+                            emo_weight,
+                            emo_text,
+                            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
+            )
+
+    with gr.Tab(i18n("多人对话")):
+        with gr.Row(elem_classes=["studio-command-grid"]):
+            with gr.Column(elem_classes=["studio-card", "studio-card--compose"]):
+                gr.HTML('<div class="studio-section-title"><span class="studio-section-title__main">Dialogue Script</span><span class="studio-section-title__meta">MULTI ROLE</span></div>')
+                dialogue_script = gr.TextArea(
+                    label=i18n("对话脚本"),
+                    lines=14,
+                    value="旁白：夜色已经很深了。\n小明：你怎么还没睡？\n小红：我在等一个答案。\n小明：什么答案？\n小红：你明天还会来吗？",
+                    placeholder=i18n("每行一个角色台词，例如：小明：你好"),
+                )
+                with gr.Row():
+                    dialogue_parse_btn = gr.Button(i18n("解析角色"), size="sm")
+                    dialogue_generate_btn = gr.Button(i18n("生成多人对话"), variant="primary", size="lg")
+            with gr.Column(elem_classes=["studio-card", "studio-card--voice"]):
+                gr.HTML('<div class="studio-section-title"><span class="studio-section-title__main">Role Voice Map</span><span class="studio-section-title__meta">VOICE LIBRARY</span></div>')
+                dialogue_voice_refresh_btn = gr.Button(i18n("刷新音色库"), size="sm")
+                dialogue_voice_library = gr.Dataframe(
+                    headers=[i18n("序号"), i18n("音色名称"), i18n("文件路径")],
+                    value=dialogue_voice_library_data(),
+                    wrap=True,
+                    interactive=False,
+                )
+                with gr.Row(elem_classes=["voice-lib-row"]):
+                    initial_dialogue_voices = voice_lib_list()
+                    dialogue_voice_picker = gr.Dropdown(
+                        choices=initial_dialogue_voices,
+                        label=i18n("选择音色"),
+                        value=initial_dialogue_voices[0] if initial_dialogue_voices else None,
+                        scale=3,
+                    )
+                    dialogue_voice_fill_btn = gr.Button(i18n("填入空位"), size="sm", scale=1)
+                dialogue_role_map = gr.TextArea(
+                    label=i18n("角色音色绑定"),
+                    lines=8,
+                    placeholder=i18n("格式：角色=音色库名称 或 角色=音频文件路径"),
+                )
+                dialogue_interval = gr.Slider(
+                    label=i18n("句间停顿 ms"),
+                    minimum=0,
+                    maximum=2000,
+                    value=450,
+                    step=50,
+                )
+                gr.Markdown(i18n("音色名称来自左侧音频生成页的音色库；也可以填写 wav/mp3/flac 文件路径。"))
+            with gr.Column(elem_classes=["studio-card", "studio-card--output"]):
+                gr.HTML('<div class="studio-section-title"><span class="studio-section-title__main">Dialogue Result</span><span class="studio-section-title__meta">OUTPUT</span></div>')
+                dialogue_output_audio = gr.Audio(label=i18n("完整对话音频"), visible=True)
+                dialogue_status = gr.Textbox(label=i18n("状态"), interactive=False)
+
+        with gr.Accordion(i18n("解析预览"), open=True):
+            dialogue_preview = gr.Dataframe(
+                headers=[i18n("序号"), i18n("角色"), i18n("台词")],
+                wrap=True,
+                interactive=False,
+            )
+        with gr.Accordion(i18n("生成明细"), open=False):
+            dialogue_manifest = gr.Dataframe(
+                headers=[i18n("序号"), i18n("角色"), i18n("台词"), i18n("音频文件")],
+                wrap=True,
+                interactive=False,
+            )
+
+    gr.HTML(PREMIUM_FOOTER_HTML)
+
+    def on_example_click(example):
+        print(f"Example clicked: ({len(example)} values) = {example!r}")
+        return (
+            gr.update(value=example[0]),
+            gr.update(value=example[1]),
+            gr.update(value=example[2]),
+            gr.update(value=example[3]),
+            gr.update(value=example[4]),
+            gr.update(value=example[5]),
+            gr.update(value=example[6]),
+            gr.update(value=example[7]),
+            gr.update(value=example[8]),
+            gr.update(value=example[9]),
+            gr.update(value=example[10]),
+            gr.update(value=example[11]),
+            gr.update(value=example[12]),
+            gr.update(value=example[13]),
+        )
+
+    # click() event works on both desktop and mobile UI
+    example_table.click(on_example_click,
+                        inputs=[example_table],
+                        outputs=[prompt_audio,
+                                 emo_control_method,
+                                 input_text_single,
+                                 emo_upload,
+                                 emo_weight,
+                                 emo_text,
+                                 vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
+    )
+
+    def on_input_text_change(text, max_text_tokens_per_segment):
+        if text and len(text) > 0:
+            text_tokens_list = tts.tokenizer.tokenize(text)
+
+            segments = tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=int(max_text_tokens_per_segment))
+            data = []
+            for i, s in enumerate(segments):
+                segment_str = ''.join(s)
+                tokens_count = len(s)
+                data.append([i, segment_str, tokens_count])
+            return {
+                segments_preview: gr.update(value=data, visible=True, type="array"),
+            }
+        else:
+            df = pd.DataFrame([], columns=[i18n("序号"), i18n("分句内容"), i18n("Token数")])
+            return {
+                segments_preview: gr.update(value=df),
+            }
+
+    # 术语词汇表事件处理函数
+    def on_add_glossary_term(term, reading_zh, reading_en):
+        """添加术语到词汇表并自动保存"""
+        term = term.rstrip()
+        reading_zh = reading_zh.rstrip()
+        reading_en = reading_en.rstrip()
+
+        if not term:
+            gr.Warning(i18n("请输入术语"))
+            return gr.update()
+            
+        if not reading_zh and not reading_en:
+            gr.Warning(i18n("请至少输入一种读法"))
+            return gr.update()
+        
+
+        # 构建读法数据
+        if reading_zh and reading_en:
+            reading = {"zh": reading_zh, "en": reading_en}
+        elif reading_zh:
+            reading = {"zh": reading_zh}
+        elif reading_en:
+            reading = {"en": reading_en}
+        else:
+            reading = reading_zh or reading_en
+
+        # 添加到词汇表
+        tts.normalizer.term_glossary[term] = reading
+
+        # 自动保存到文件
+        try:
+            tts.normalizer.save_glossary_to_yaml(tts.glossary_path)
+            gr.Info(i18n("词汇表已更新"), duration=1)
+        except Exception as e:
+            gr.Error(i18n("保存词汇表时出错"))
+            print(f"Error details: {e}")
+            return gr.update()
+
+        # 更新Markdown表格
+        return gr.update(value=format_glossary_markdown())
+        
+
+    def on_method_change(emo_control_method):
+        if emo_control_method == 1:  # emotion reference audio
+            return (gr.update(visible=True),
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=True)
+                    )
+        elif emo_control_method == 2:  # emotion vectors
+            return (gr.update(visible=False),
+                    gr.update(visible=True),
+                    gr.update(visible=True),
+                    gr.update(visible=False),
+                    gr.update(visible=True)
+                    )
+        elif emo_control_method == 3:  # emotion text description
+            return (gr.update(visible=False),
+                    gr.update(visible=True),
+                    gr.update(visible=False),
+                    gr.update(visible=True),
+                    gr.update(visible=True)
+                    )
+        else:  # 0: same as speaker voice
+            return (gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=False),
+                    gr.update(visible=False)
+                    )
+
+    emo_control_method.change(on_method_change,
+        inputs=[emo_control_method],
+        outputs=[emotion_reference_group,
+                 emotion_randomize_group,
+                 emotion_vector_group,
+                 emo_text_group,
+                 emo_weight_group]
+    )
+
+    def on_experimental_change(is_experimental, current_mode_index):
+        # 切换情感控制选项
+        new_choices = EMO_CHOICES_ALL if is_experimental else EMO_CHOICES_OFFICIAL
+        # if their current mode selection doesn't exist in new choices, reset to 0.
+        # we don't verify that OLD index means the same in NEW list, since we KNOW it does.
+        new_index = current_mode_index if current_mode_index < len(new_choices) else 0
+
+        return (
+            gr.update(choices=new_choices, value=new_choices[new_index]),
+            gr.update(samples=get_example_cases(include_experimental=is_experimental)),
+        )
+
+    experimental_checkbox.change(
+        on_experimental_change,
+        inputs=[experimental_checkbox, emo_control_method],
+        outputs=[emo_control_method, example_table]
+    )
+
+    def on_glossary_checkbox_change(is_enabled):
+        """控制术语词汇表的可见性"""
+        tts.normalizer.enable_glossary = is_enabled
+        return gr.update(visible=is_enabled)
+
+    glossary_checkbox.change(
+        on_glossary_checkbox_change,
+        inputs=[glossary_checkbox],
+        outputs=[glossary_accordion]
+    )
+
+    input_text_single.change(
+        on_input_text_change,
+        inputs=[input_text_single, max_text_tokens_per_segment],
+        outputs=[segments_preview]
+    )
+
+    max_text_tokens_per_segment.change(
+        on_input_text_change,
+        inputs=[input_text_single, max_text_tokens_per_segment],
+        outputs=[segments_preview]
+    )
+
+    prompt_audio.upload(update_prompt_audio,
+                         inputs=[],
+                         outputs=[gen_button])
+
+    # Voice library events — shared between speaker and emotion reference slots.
+    voice_save_btn.click(
+        on_save_to_library,
+        inputs=[prompt_audio, voice_save_name],
+        outputs=[voice_dropdown, emo_dropdown],
+    )
+    voice_load_btn.click(
+        on_load_from_library,
+        inputs=[voice_dropdown],
+        outputs=[prompt_audio],
+    )
+    voice_delete_btn.click(
+        on_delete_from_library,
+        inputs=[voice_dropdown],
+        outputs=[voice_dropdown, emo_dropdown],
+    )
+
+    emo_save_btn.click(
+        on_save_to_library,
+        inputs=[emo_upload, emo_save_name],
+        outputs=[emo_dropdown, voice_dropdown],
+    )
+    emo_load_btn.click(
+        on_load_from_library,
+        inputs=[emo_dropdown],
+        outputs=[emo_upload],
+    )
+    emo_delete_btn.click(
+        on_delete_from_library,
+        inputs=[emo_dropdown],
+        outputs=[emo_dropdown, voice_dropdown],
+    )
+
+    def on_demo_load():
+        """页面加载时重新加载glossary数据"""
+        try:
+            tts.normalizer.load_glossary_from_yaml(tts.glossary_path)
+        except Exception as e:
+            gr.Error(i18n("加载词汇表时出错"))
+            print(f"Failed to reload glossary on page load: {e}")
+        return gr.update(value=format_glossary_markdown())
+
+    # 术语词汇表事件绑定
+    btn_add_term.click(
+        on_add_glossary_term,
+        inputs=[glossary_term, glossary_reading_zh, glossary_reading_en],
+        outputs=[glossary_table]
+    )
+
+    # 页面加载时重新加载glossary
+    demo.load(
+        on_demo_load,
+        inputs=[],
+        outputs=[glossary_table]
+    )
+
+    # 页面加载时刷新音色库下拉
+    demo.load(
+        on_refresh_library,
+        inputs=[],
+        outputs=[voice_dropdown, emo_dropdown],
+    )
+
+    dialogue_voice_refresh_btn.click(
+        refresh_dialogue_voice_library,
+        inputs=[],
+        outputs=[dialogue_voice_library, dialogue_voice_picker],
+    )
+
+    dialogue_voice_fill_btn.click(
+        fill_dialogue_voice_mapping,
+        inputs=[dialogue_role_map, dialogue_voice_picker],
+        outputs=[dialogue_role_map],
+    )
+
+    dialogue_parse_btn.click(
+        build_role_mapping_template,
+        inputs=[dialogue_script, dialogue_role_map],
+        outputs=[dialogue_role_map, dialogue_preview],
+    )
+
+    def gen_dialogue_locked(script, role_mapping_text, interval_ms, max_text_tokens_per_segment, *args, progress=gr.Progress()):
+        with mutex:
+            return gen_dialogue(
+                script,
+                role_mapping_text,
+                interval_ms,
+                max_text_tokens_per_segment,
+                *args,
+                progress=progress,
+            )
+
+    dialogue_generate_btn.click(
+        gen_dialogue_locked,
+        inputs=[
+            dialogue_script,
+            dialogue_role_map,
+            dialogue_interval,
+            max_text_tokens_per_segment,
+            *advanced_params,
+        ],
+        outputs=[dialogue_output_audio, dialogue_manifest, dialogue_status],
+    )
+
+    demo.load(
+        build_role_mapping_template,
+        inputs=[dialogue_script, dialogue_role_map],
+        outputs=[dialogue_role_map, dialogue_preview],
+    )
+
+    demo.load(
+        refresh_dialogue_voice_library,
+        inputs=[],
+        outputs=[dialogue_voice_library, dialogue_voice_picker],
+    )
+
+    gen_button.click(gen_single,
+                     inputs=[emo_control_method,prompt_audio, input_text_single, emo_upload, emo_weight,
+                            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+                             emo_text,emo_random,
+                             max_text_tokens_per_segment,
+                             *advanced_params,
+                     ],
+                     outputs=[output_audio])
+
+
+
+if __name__ == "__main__":
+    demo.queue(20)
+    demo.launch(server_name=cmd_args.host, server_port=cmd_args.port, inbrowser=True)
+
+
+
+
