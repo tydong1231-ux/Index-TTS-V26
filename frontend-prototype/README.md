@@ -1,29 +1,42 @@
-# VoiceBook Studio — Frontend Interaction Prototype
+# VoiceBook Studio Frontend
 
-这是一个无依赖、可直接打开的交互原型，用于确认“小说 TXT → AI 拆分角色/旁白 → 全书角色统一音色 → 分章生成 → 合成导出”的产品流程。
+The confirmed two-level interaction model is connected to the FastAPI backend:
 
-## 运行
+1. **Project workspace** — chapters, project-wide roles and voices, batch jobs, settings, and export state stay on one page.
+2. **Chapter workspace** — source, role split, voice references, synthesis, and QA stay on one child page.
 
-直接下载并打开 `index.html`。该文件会在浏览器中解压并加载完整原型，建议使用较新的 Chrome、Edge 或 Safari。
+The frontend calls `/api/health` on startup. When the backend is unavailable, it switches to built-in demonstration data rather than rendering an unusable page.
 
-## 原型范围
+## Run
 
-- 项目概览：整体进度、异常章节和下一步行动。
-- 章节流水线：多选、筛选、阶段确认、单章重跑、批量串行处理。
-- 角色与音色：全书统一角色表、AI 一键匹配、人工试听与调整、年龄变体入口。
-- 脚本工作台：逐句检查旁白/角色/情绪、低置信度筛选、单句修改与版本保留。
-- 生成队列：默认逐段顺序生成、实验性按角色批量调度、暂停和重试。
-- 导出：分章音频、工程清单、角色映射与完整有声书输出。
-- 设置：OpenAI-compatible Base URL、API Key、模型、IndexTTS 与本地存储配置。
+From the repository root:
 
-## 设计原则
+```bash
+pip install -r app/requirements-audiobook.txt
+```
 
-- 冷灰白页面底色，统一白色表面，列表使用发丝分隔线。
-- 玻璃效果只用于吸顶导航、弹层和批量操作条。
-- 正文保持黑白灰，蓝色只用于主操作和选中状态。
-- 同类内容聚合到一张面板，不堆叠大量独立卡片。
-- 所有关键状态都就地反馈；重跑优先于破坏性覆盖。
+Windows:
 
-## 说明
+```bat
+start_audiobook_studio.bat
+```
 
-当前仓库版本为单文件交互原型，数据、样式和交互均内嵌于 `index.html`。它不会请求 LLM、调用 IndexTTS 或读写真实项目文件。
+macOS/Linux:
+
+```bash
+sh start_audiobook_studio.sh
+```
+
+Then open `http://127.0.0.1:7861`.
+
+## Repository layout
+
+- `index.html` — small production loader served by FastAPI.
+- `chunks/` — generated compressed runtime containing the complete HTML, CSS, and JavaScript UI.
+- `source/api.js` — readable backend API client.
+- `source/app-core.js` — state, backend initialization, and data mapping.
+- `source/app-ui.js` — project and chapter rendering.
+- `source/app-actions.js` — event handlers, batch jobs, and chapter actions.
+- `source/style-*.css` — readable design-system, project, chapter, overlay, and responsive styles.
+
+The runtime bundle is generated from these source modules and the semantic page template. The split runtime avoids a single oversized GitHub Contents API write while keeping the served application self-contained.
