@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VoiceBook Studio</title>
+<body>
+<p style="font-family:-apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;padding:24px;color:#6e6e73">Loading VoiceBook Studio…</p>
+<script src="./chunks/0.js"></script>
+<script src="./chunks/1.js"></script>
+<script src="./chunks/2.js"></script>
+<script src="./chunks/3.js"></script>
+<script src="./chunks/4.js"></script>
+<script>
+(async()=>{
+  try{
+    const bytes=Uint8Array.from(atob(window.__vb||''),c=>c.charCodeAt(0));
+    if(!('DecompressionStream' in window)) throw new Error('This browser does not support DecompressionStream. Please use a current Chrome, Edge, or Safari release.');
+    const html=await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+    document.open();document.write(html);document.close();
+  }catch(error){
+    document.body.innerHTML=`<main style="font-family:-apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;max-width:720px;margin:80px auto;padding:24px"><h1>VoiceBook Studio could not start</h1><p>${String(error.message||error)}</p></main>`;
+  }
+})();
+</script>
+</body>
